@@ -1,24 +1,27 @@
-use std::io::{self, BufRead};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use windows::Win32::Media::Audio::{WAVEFORMATEX, WAVE_FORMAT_PCM};
-
 use anyhow::Result;
 use chrono::Utc;
-use tracing::{error, info};
-use tracing_subscriber;
-
-use windows::{
-    core::*,
-    Win32::{
-        Media::Audio::{
-            eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-            MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        },
-        System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
-    },
-};
+use std::io::Write;
+use std::io::{self};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+use tracing::error;
+use tracing::info;
+use windows::Win32::Media::Audio::eConsole;
+use windows::Win32::Media::Audio::eRender;
+use windows::Win32::Media::Audio::IAudioCaptureClient;
+use windows::Win32::Media::Audio::IAudioClient;
+use windows::Win32::Media::Audio::IMMDeviceEnumerator;
+use windows::Win32::Media::Audio::MMDeviceEnumerator;
+use windows::Win32::Media::Audio::AUDCLNT_SHAREMODE_SHARED;
+use windows::Win32::Media::Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
+use windows::Win32::Media::Audio::WAVEFORMATEX;
+use windows::Win32::Media::Audio::WAVE_FORMAT_PCM;
+use windows::Win32::System::Com::CoCreateInstance;
+use windows::Win32::System::Com::CoInitializeEx;
+use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::System::Com::COINIT_MULTITHREADED;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -46,12 +49,11 @@ fn main() -> Result<()> {
 
     // Main loop
     let stdin = io::stdin();
-    println!("Press Enter to start/stop recording...");
-
     loop {
+        println!("Press Enter to start/stop recording...");
+        std::io::stdout().flush()?;
         let mut input = String::new();
         stdin.read_line(&mut input)?;
-        input.clear();
 
         let mut is_recording_lock = is_recording.lock().unwrap();
 
@@ -61,7 +63,7 @@ fn main() -> Result<()> {
             info!("State changed to Idle");
 
             // Save audio data to file
-            let audio_data_lock = audio_data.lock().unwrap();
+            let mut audio_data_lock = audio_data.lock().unwrap();
 
             if audio_data_lock.is_empty() {
                 info!("No audio data captured");
@@ -69,7 +71,7 @@ fn main() -> Result<()> {
                 // Get the mix_format
                 let mix_format_value = {
                     let mix_format_lock = mix_format.lock().unwrap();
-                    mix_format_lock.clone()
+                    *mix_format_lock
                 };
 
                 if let Some(mix_format_value) = mix_format_value {
@@ -91,7 +93,7 @@ fn main() -> Result<()> {
             }
 
             // Clear audio data
-            audio_data.lock().unwrap().clear();
+            audio_data_lock.clear();
 
             "Idle"
         } else {
@@ -119,6 +121,8 @@ fn capture_audio(
     mix_format: Arc<Mutex<Option<WAVEFORMATEX>>>,
 ) -> Result<()> {
     unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
@@ -149,10 +153,23 @@ fn capture_audio(
         let capture_client: IAudioCaptureClient =
             audio_client.GetService::<IAudioCaptureClient>()?;
 
-        audio_client.Start()?;
+        // Add a variable to track the previous recording state
+        let mut was_recording = false;
 
         loop {
             let recording = { *is_recording.lock().unwrap() };
+
+            if recording && !was_recording {
+                // Transition from not recording to recording
+                audio_client.Start()?;
+                was_recording = true;
+                info!("Audio client started");
+            } else if !recording && was_recording {
+                // Transition from recording to not recording
+                audio_client.Stop()?;
+                was_recording = false;
+                info!("Audio client stopped");
+            }
 
             if !recording {
                 thread::sleep(Duration::from_millis(100));
@@ -189,17 +206,17 @@ fn capture_audio(
             thread::sleep(Duration::from_millis(10));
         }
 
+        // Uncomment if you plan to exit the loop and need to clean up
         // audio_client.Stop()?;
         // CoUninitialize();
     }
 }
 
 fn save_as_wav(audio_data: &[u8], filename: &str, mix_format: &WAVEFORMATEX) -> Result<()> {
-
     use hound::WavSpec;
 
     let spec = WavSpec {
-        channels: mix_format.nChannels as u16,
+        channels: mix_format.nChannels,
         sample_rate: mix_format.nSamplesPerSec,
         bits_per_sample: mix_format.wBitsPerSample,
         sample_format: if mix_format.wFormatTag == WAVE_FORMAT_PCM as u16 {
