@@ -2,6 +2,7 @@ use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use windows::Win32::Media::Audio::{WAVEFORMATEX, WAVE_FORMAT_PCM};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -31,12 +32,14 @@ fn main() -> Result<()> {
 
     let is_recording = Arc::new(Mutex::new(false));
     let audio_data = Arc::new(Mutex::new(Vec::new()));
+    let mix_format = Arc::new(Mutex::new(None));
 
     let is_recording_clone = Arc::clone(&is_recording);
     let audio_data_clone = Arc::clone(&audio_data);
+    let mix_format_clone = Arc::clone(&mix_format);
 
     let _capture_thread = thread::spawn(move || {
-        if let Err(e) = capture_audio(is_recording_clone, audio_data_clone) {
+        if let Err(e) = capture_audio(is_recording_clone, audio_data_clone, mix_format_clone) {
             error!("Capture thread error: {:?}", e);
         }
     });
@@ -47,7 +50,8 @@ fn main() -> Result<()> {
 
     loop {
         let mut input = String::new();
-        stdin.lock().read_line(&mut input)?;
+        stdin.read_line(&mut input)?;
+        input.clear();
 
         let mut is_recording_lock = is_recording.lock().unwrap();
 
@@ -62,17 +66,27 @@ fn main() -> Result<()> {
             if audio_data_lock.is_empty() {
                 info!("No audio data captured");
             } else {
-                // Save to file
-                let timestamp = Utc::now().format("%Y%m%dT%H%M%S");
-                let filename = format!("captures/{}.wav", timestamp);
+                // Get the mix_format
+                let mix_format_value = {
+                    let mix_format_lock = mix_format.lock().unwrap();
+                    mix_format_lock.clone()
+                };
 
-                // Ensure captures directory exists
-                std::fs::create_dir_all("captures")?;
+                if let Some(mix_format_value) = mix_format_value {
+                    // Save to file
+                    let timestamp = Utc::now().format("%Y%m%dT%H%M%S");
+                    let filename = format!("captures/{}.wav", timestamp);
 
-                // Save as WAV file
-                match save_as_wav(&audio_data_lock, &filename) {
-                    Ok(_) => info!("Audio saved to {}", filename),
-                    Err(e) => error!("Failed to save audio: {:?}", e),
+                    // Ensure captures directory exists
+                    std::fs::create_dir_all("captures")?;
+
+                    // Save as WAV file
+                    match save_as_wav(&audio_data_lock, &filename, &mix_format_value) {
+                        Ok(_) => info!("Audio saved to {}", filename),
+                        Err(e) => error!("Failed to save audio: {:?}", e),
+                    }
+                } else {
+                    error!("Mix format not available");
                 }
             }
 
@@ -99,7 +113,11 @@ fn main() -> Result<()> {
     // Ok(())
 }
 
-fn capture_audio(is_recording: Arc<Mutex<bool>>, audio_data: Arc<Mutex<Vec<u8>>>) -> Result<()> {
+fn capture_audio(
+    is_recording: Arc<Mutex<bool>>,
+    audio_data: Arc<Mutex<Vec<u8>>>,
+    mix_format: Arc<Mutex<Option<WAVEFORMATEX>>>,
+) -> Result<()> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -109,7 +127,13 @@ fn capture_audio(is_recording: Arc<Mutex<bool>>, audio_data: Arc<Mutex<Vec<u8>>>
         let audio_client: IAudioClient = device.Activate::<IAudioClient>(CLSCTX_ALL, None)?;
 
         let mix_format_ptr = audio_client.GetMixFormat()?;
-        let mix_format = *mix_format_ptr;
+        let mix_format_value = *mix_format_ptr;
+
+        // Store mix_format for use in main thread
+        {
+            let mut mix_format_lock = mix_format.lock().unwrap();
+            *mix_format_lock = Some(mix_format_value);
+        }
 
         let hns_requested_duration = 10000000; // 1 second in 100-ns units
 
@@ -150,7 +174,7 @@ fn capture_audio(is_recording: Arc<Mutex<bool>>, audio_data: Arc<Mutex<Vec<u8>>>
                     None,
                 )?;
 
-                let bytes_per_frame = mix_format.nBlockAlign as usize;
+                let bytes_per_frame = mix_format_value.nBlockAlign as usize;
                 let data_size = (num_frames_available as usize) * bytes_per_frame;
 
                 let data_slice = std::slice::from_raw_parts(data_ptr, data_size);
@@ -170,30 +194,51 @@ fn capture_audio(is_recording: Arc<Mutex<bool>>, audio_data: Arc<Mutex<Vec<u8>>>
     }
 }
 
-fn save_as_wav(audio_data: &[u8], filename: &str) -> Result<()> {
-    // Use hound crate to write WAV file
+fn save_as_wav(audio_data: &[u8], filename: &str, mix_format: &WAVEFORMATEX) -> Result<()> {
+
     use hound::WavSpec;
 
-    // Assuming 16-bit stereo PCM
     let spec = WavSpec {
-        channels: 2,
-        sample_rate: 44100,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        channels: mix_format.nChannels as u16,
+        sample_rate: mix_format.nSamplesPerSec,
+        bits_per_sample: mix_format.wBitsPerSample,
+        sample_format: if mix_format.wFormatTag == WAVE_FORMAT_PCM as u16 {
+            hound::SampleFormat::Int
+        } else {
+            hound::SampleFormat::Float
+        },
     };
 
     let mut writer = hound::WavWriter::create(filename, spec)?;
 
-    // Write samples
-    let samples = audio_data
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]));
+    // Handle sample conversion based on bits per sample and format
+    // For example, if bits_per_sample == 16 and sample_format == Int
+    let bytes_per_sample = (mix_format.wBitsPerSample / 8) as usize;
+
+    let samples =
+        audio_data
+            .chunks_exact(bytes_per_sample)
+            .map(|b| match mix_format.wBitsPerSample {
+                16 => i16::from_le_bytes([b[0], b[1]]) as f32 / i16::MAX as f32,
+                24 => {
+                    let value = i32::from_le_bytes([b[0], b[1], b[2], 0]);
+                    value as f32 / 8388607.0 // 24-bit max value
+                }
+                32 => {
+                    if mix_format.wFormatTag == WAVE_FORMAT_PCM as u16 {
+                        let value = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        value as f32 / i32::MAX as f32
+                    } else {
+                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    }
+                }
+                _ => 0.0,
+            });
 
     for sample in samples {
         writer.write_sample(sample)?;
     }
 
     writer.finalize()?;
-
     Ok(())
 }
